@@ -43,7 +43,7 @@ AcoustiQ optimizes in the **energy domain** (magnitude squared), where errors ar
 
 ## Features
 
-- **Energy Domain Optimization**: Perceptually accurate results with raw, unsmoothed data (see above)
+- **Energy Domain Optimization**: Perceptually accurate results with raw, unsmoothed data
 - **Intelligent Filter Fitting**: Fits peaking, low-shelf, and high-shelf IIR biquad filters to correction curves
 - **Interactive GUI**: Professional mixer-style knobs with real-time EQ adjustment (PyQt6)
 - **Filter Management**: Toggle filters on/off, adjust parameters with visual feedback
