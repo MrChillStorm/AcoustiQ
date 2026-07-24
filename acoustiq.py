@@ -29,6 +29,9 @@ Filter parameters are output with precision matching GUI step sizes (Fc: 0.01 Hz
 """
 
 import argparse
+import os
+import numba
+from numba import njit
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
@@ -54,7 +57,7 @@ OPT_SETTINGS = {
     "bounds": {
         "fc": (20.0, 20000.0),
         "Q": (0.1, 10.0),
-        "shelf_Q": (0.01, 1.0),
+        "shelf_Q": (0.01, 1.00),
         "gain_db": (-12.0, 12.0)
     }
 }
@@ -192,6 +195,42 @@ class GlowDial(QDial):
         finally:
             painter.end()  # GUARANTEED CLEANUP
 
+def apply_custom_filter_masks(freqs_fit, mask1_str=None, mask2_str=None):
+    """
+    Apply up to two rectangular suppression masks.
+    width_hz = full frequency range where weight is reduced by exactly depth_db.
+    Returns multiplier array (values ≤ 1.0) to multiply into weight_fit.
+    """
+    mask = np.ones_like(freqs_fit, dtype=float)
+
+    applied = False
+    for spec, name in [(mask1_str, "1"), (mask2_str, "2")]:
+        if not spec:
+            continue
+        try:
+            c, w, d = map(float, [x.strip() for x in spec.split(',')])
+            if not (20 < c < 30000 and w > 0 and d > 0):
+                raise ValueError("center, width or depth out of range")
+
+            low  = c - w/2
+            high = c + w/2
+            region = (freqs_fit >= low) & (freqs_fit <= high)
+            factor = 10.0 ** (-d / 20.0)
+
+            mask[region] *= factor
+            applied = True
+
+            print(f"Filter mask {name} ENABLED: {c:.0f} Hz ± {w/2:.0f} Hz "
+                  f"({low:.0f}–{high:.0f} Hz) → weight × {factor:.5f} (–{d:.1f} dB)")
+
+        except Exception as e:
+            print(f"ERROR in --filter-mask{name} '{spec}': {e} → ignored")
+
+    if not applied:
+        print("No filter masks applied")
+
+    return mask
+
 # ---------------------------
 # Peaking Biquad (RBJ)
 # ---------------------------
@@ -251,61 +290,165 @@ def low_shelf_biquad(fc, Q, gain_db, fs):
     a = np.array([1.0, a1 / a0, a2 / a0])
     return b, a
 
-# NOTE: Accept precomputed z vector instead of recomputing exp(-j*w) each time
-def biquad_freq_response(b, a, z):
-    z1 = z**-1
-    z2 = z**-2
+# NOTE: z1 and z2 are precomputed once per frequency grid and passed in.
+def biquad_freq_response(b, a, z1, z2):
     num = b[0] + b[1] * z1 + b[2] * z2
     den = 1.0 + a[1] * z1 + a[2] * z2
     return num / den
 
-def total_response(params, z, fs, n_filters, use_high_shelf=False, use_low_shelf=False, filter_states=None):
-    H = np.ones_like(z, dtype=np.complex128)
-    for i in range(n_filters):
-        if filter_states is not None and not filter_states[i]:
-            continue  # Skip disabled filters
-        fc, Q, g = params[i*3:(i+1)*3]
-        if use_high_shelf and i == (n_filters - 1):
-            b, a = high_shelf_biquad(fc, Q, g, fs)
-        elif use_low_shelf and i == 0:
-            b, a = low_shelf_biquad(fc, Q, g, fs)
-        else:
-            b, a = peaking_biquad(fc, Q, g, fs)
-        H *= biquad_freq_response(b, a, z)
-    return H
+# ─────────────────────────────────────────────────────────────────────────────
+# NUMBA HELPERS — imported from acoustiq_kernels
+#
+# The @njit kernels live in acoustiq_kernels.py, a proper importable module on
+# sys.path, so Numba's cache=True can serialise/deserialise them correctly in
+# spawned worker processes.  Loading acoustiq via exec_module() gives it the
+# module name '<dynamic>', which Numba records in its cache pickle; worker
+# processes then fail with "No module named '<dynamic>'".  Keeping the kernels
+# in a real module sidesteps this entirely.
+# ─────────────────────────────────────────────────────────────────────────────
+from acoustiq_kernels import (  # noqa: E402
+    _peaking_nb,
+    _low_shelf_nb,
+    _high_shelf_nb,
+    _total_response_nb,
+    _static_response_nb,
+)
 
-def residuals(param_vec, z_fit, desired_linear, n_filters, weight,
-              anchor_enable=True, anchor_weight=50.0, ref_hz=1000.0,
-              use_high_shelf=False, use_low_shelf=False, filter_states=None, fs=48000.0):
-    """Calculate residuals in energy domain (magnitude squared)"""
 
-    # Build full params (disabled filters keep initial values)
-    full_params = param_vec.copy()
+def total_response(params, z, fs, n_filters, use_high_shelf=False,
+                   use_low_shelf=False, filter_states=None,
+                   z1=None, z2=None):
+    if z1 is None: z1 = z ** -1
+    if z2 is None: z2 = z ** -2
+
+    p   = params.reshape(n_filters, 3)
+    fcs = np.ascontiguousarray(p[:, 0], dtype=np.float64)
+    Qs  = np.ascontiguousarray(p[:, 1], dtype=np.float64)
+    gs  = np.ascontiguousarray(p[:, 2], dtype=np.float64)
+
     if filter_states is not None:
-        j = 0
-        for i in range(n_filters):
-            if filter_states[i]:
-                full_params[i*3:(i+1)*3] = param_vec[j*3:(j+1)*3]
-                j += 1
+        states = np.asarray(filter_states, dtype=np.bool_)
+    else:
+        states = np.ones(n_filters, dtype=np.bool_)
 
-    # Compute full response
-    H = total_response(full_params, z_fit, fs, n_filters, use_high_shelf, use_low_shelf, filter_states)
-    mag_linear = np.abs(H)
+    return _total_response_nb(fcs, Qs, gs, states,
+                              np.ascontiguousarray(z1),
+                              np.ascontiguousarray(z2),
+                              n_filters, use_high_shelf, use_low_shelf, fs)
 
-    # Residuals in energy domain
-    mag_energy = mag_linear**2
-    desired_energy = desired_linear**2
-    res = (mag_energy - desired_energy) * weight
 
-    # Anchor constraint at reference frequency
+def static_filter_response(static_params, z, fs, z1=None, z2=None):
+    """Compute the combined frequency response of all static (pinned) filters.
+
+    static_params is a list of (ftype, fc, Q, gain_db) tuples where
+    ftype is one of 'PK', 'HS', 'LS'.
+    Returns a complex array H of the same length as z.
+    """
+    if z1 is None: z1 = z ** -1
+    if z2 is None: z2 = z ** -2
+
+    n_static = len(static_params)
+    if n_static == 0:
+        return np.ones_like(z, dtype=np.complex128)
+
+    _ftype_map = {'PK': 0, 'HS': 1, 'LS': 2}
+    fcs    = np.empty(n_static, dtype=np.float64)
+    Qs     = np.empty(n_static, dtype=np.float64)
+    gs     = np.empty(n_static, dtype=np.float64)
+    ftypes = np.empty(n_static, dtype=np.int64)
+
+    for i, (ftype, fc, Q, gain_db) in enumerate(static_params):
+        fcs[i]    = fc
+        Qs[i]     = Q
+        gs[i]     = gain_db
+        ftypes[i] = _ftype_map.get(ftype, 0)
+
+    return _static_response_nb(fcs, Qs, gs, ftypes,
+                               np.ascontiguousarray(z1),
+                               np.ascontiguousarray(z2),
+                               n_static, fs)
+
+
+def residuals(param_vec, z_fit, z1_fit, z2_fit, desired_linear, n_filters, weight,
+              anchor_enable=True, anchor_weight=50.0, ref_hz=1000.0,
+              use_high_shelf=False, use_low_shelf=False, filter_states=None, fs=48000.0,
+              static_params=None, adjusted_desired=None, desired_energy=None,
+              z_ref=None, h_sta_ref=None, h_sta_ref_energy=None,
+              z_fit_with_ref=None, z1_fit_with_ref=None, z2_fit_with_ref=None):
+    """Calculate residuals in energy domain (magnitude squared).
+
+    adjusted_desired:    precomputed desired_linear with static filter removed.
+    desired_energy:      precomputed adjusted_desired**2 (constant across iterations).
+    z_ref:               precomputed exp(-j*2*pi*ref_hz/fs) scalar for anchor.
+    h_sta_ref:           precomputed static filter response at ref_hz (complex scalar).
+    z1_fit, z2_fit:      precomputed z**-1 and z**-2 for the fit grid.
+    z_fit_with_ref:      z_fit with z_ref appended — lets total_response evaluate fit
+                         grid + anchor point in one call.
+
+    NOTE: do NOT add a shared pre-allocated output buffer parameter here.
+    scipy's Jacobian calls residuals twice per parameter and immediately diffs the
+    two return values. A shared buffer makes both calls return the same object so
+    the diff is always zero (zero Jacobian → optimizer blind). Each call must
+    return its own freshly allocated array.
+    """
+
+    # Fallback path (legacy / GUI calls without precomputed values)
+    if adjusted_desired is None:
+        if static_params:
+            H_static = static_filter_response(static_params, z_fit, fs, z1_fit, z2_fit)
+            mag_static = np.abs(H_static)
+            adjusted_desired = desired_linear / np.maximum(mag_static, 1e-12)
+        else:
+            adjusted_desired = desired_linear
+    if desired_energy is None:
+        desired_energy = adjusted_desired ** 2
+
+    # param_vec must always be the full n_filters*3 vector (enabled + disabled filters).
+    # total_response skips disabled filters internally via filter_states, so no
+    # remapping is needed here.  The old "compact→full" remap was wrong: it assumed
+    # param_vec contained only active-filter params, but least_squares (both the main
+    # path and the GUI reoptimize path below) always passes the full-length vector.
+    # On a full-length vector the remap silently overwrote enabled filters that came
+    # after a disabled one with the wrong neighbour's params.
+    full_params = param_vec
+
+    # Fix 1: evaluate fit grid + anchor point in a single total_response call
+    if anchor_enable and z_fit_with_ref is not None:
+        H_all = total_response(full_params, z_fit_with_ref, fs, n_filters,
+                               use_high_shelf, use_low_shelf, filter_states,
+                               z1=z1_fit_with_ref, z2=z2_fit_with_ref)
+        H        = H_all[:-1]
+        h_var    = H_all[-1]
+    else:
+        H = total_response(full_params, z_fit, fs, n_filters,
+                           use_high_shelf, use_low_shelf, filter_states,
+                           z1=z1_fit, z2=z2_fit)
+        h_var = None
+
+    # Avoid sqrt: |H|^2 == H.real^2 + H.imag^2 (np.abs computes sqrt then we'd square it back)
+    mag_energy = H.real**2 + H.imag**2
+
+    n_fit = len(z_fit)
+    out = np.empty(n_fit + (1 if anchor_enable else 0))
+    out[:n_fit] = (mag_energy - desired_energy) * weight
+
     if anchor_enable:
-        z_ref = np.exp(-1j * 2.0 * math.pi * ref_hz / fs)
-        h_ref = total_response(full_params, np.array([z_ref]), fs, n_filters, use_high_shelf, use_low_shelf, filter_states)[0]
-        mag_ref_linear = np.abs(h_ref)
-        mag_ref_energy = mag_ref_linear**2
-        res = np.concatenate([res, np.array([(mag_ref_energy - 1.0) * anchor_weight])])
+        if h_var is None:
+            # fallback if z_fit_with_ref wasn't provided
+            if z_ref is None:
+                z_ref = np.exp(-1j * 2.0 * math.pi * ref_hz / fs)
+            h_var = total_response(full_params, np.array([z_ref]), fs, n_filters,
+                                   use_high_shelf, use_low_shelf, filter_states)[0]
+        if h_sta_ref is None:
+            h_sta_ref = 1.0 + 0j
+        # Use precomputed |h_sta_ref|^2 if available, otherwise compute it once here
+        if h_sta_ref_energy is None:
+            h_sta_ref_energy = h_sta_ref.real**2 + h_sta_ref.imag**2 if hasattr(h_sta_ref, 'real') else float(h_sta_ref)**2
+        # |h_var * h_sta_ref|^2 == |h_var|^2 * |h_sta_ref|^2, no sqrt needed
+        mag_ref_energy = (h_var.real**2 + h_var.imag**2) * h_sta_ref_energy
+        out[n_fit] = (mag_ref_energy - 1.0) * anchor_weight
 
-    return res, [], []
+    return out, [], []
 
 def pretty_filters_from_params(params, n_filters, filter_states, filter_types):
     filters = []
@@ -314,6 +457,7 @@ def pretty_filters_from_params(params, n_filters, filter_states, filter_types):
         typ = filter_types[i]
         state = 'ON' if filter_states[i] else 'OFF'
         filters.append((typ, fc, Q, g, state))
+    filters.sort(key=lambda x: x[1])   # sort by Fc so output file is always frequency-ordered
     return filters
 
 def smooth_vector(x, kernel_size):
@@ -417,8 +561,13 @@ class EQWindow(QMainWindow):
                 fc_low_shelf_low=None,
                 fc_low_shelf_high=None,
                 fc_shelf_low=None,
-                fc_shelf_high=None):
+                fc_shelf_high=None,
+                parsed_static_filter=None):
         super().__init__()
+
+        # Store the static (pinned) filter — (ftype, fc, Q, gain_db) or None
+        self.parsed_static_filter = parsed_static_filter
+        self.static_params_list = [parsed_static_filter] if parsed_static_filter else None
 
         self.use_low_shelf = use_low_shelf
         self.use_high_shelf = use_high_shelf
@@ -557,9 +706,11 @@ class EQWindow(QMainWindow):
         main_layout.addWidget(self.plot_widget)
 
         # Initial plot
-        self.meas_plot = self.plot_widget.plot(self.freqs_full, self.meas_abs, pen=pg.mkPen('deepskyblue', width=2), name='Measurement', antialias=True)
+        self.meas_plot = self.plot_widget.plot(self.freqs_full, self.meas_abs, pen=pg.mkPen('deepskyblue', width=2), name=os.path.splitext(os.path.basename(self.source_file))[0], antialias=True)
         self.tgt_plot = self.plot_widget.plot(self.freqs_full, self.target_abs, pen=pg.mkPen('gold', width=2), name='Target', antialias=True)
         H = total_response(self.params, self.z_full, self.fs, self.n_filters, self.use_high_shelf, self.use_low_shelf, self.filter_states)
+        if self.static_params_list:
+            H = H * static_filter_response(self.static_params_list, self.z_full, self.fs)
         mag_linear = np.abs(H)
         mag_db = 20.0 * np.log10(np.maximum(mag_linear, 1e-12))
         self.best_rmse_linear = np.sqrt(np.mean((mag_linear[self.fit_mask] - self.desired_linear_fit)**2))
@@ -697,7 +848,108 @@ class EQWindow(QMainWindow):
             v_layout.addWidget(g_edit)
 
             controls_layout.addLayout(v_layout)
+
+        # ----------------------------------------------------------------
+        # STATIC FILTER PANEL — appended after variable filters, locked
+        # ----------------------------------------------------------------
+        if self.parsed_static_filter:
+            sf_type, sf_fc, sf_Q, sf_gain = self.parsed_static_filter
+
+            sf_layout = QVBoxLayout()
+            sf_layout.setSpacing(4)
+
+            # Header label
+            sf_header = QLabel(f"🔒 STATIC\n{sf_type}")
+            sf_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sf_header.setStyleSheet(
+                "font-weight: bold; font-size: 11px; color: #ff9900; "
+                "background-color: #3a2800; border: 1px solid #ff9900; "
+                "border-radius: 4px; padding: 3px;"
+            )
+            sf_layout.addWidget(sf_header)
+
+            # Fc
+            fc_lbl = QLabel("Fc (Hz)")
+            fc_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fc_lbl.setStyleSheet("font-weight: bold; color: #33bbff;")
+            sf_layout.addWidget(fc_lbl)
+
+            sf_fc_dial = GlowDial(self, glow_color="#ff9900", accent_color="#ff9900")
+            sf_fc_dial.setMinimum(int(OPT_SETTINGS["bounds"]["fc"][0] * 100))
+            sf_fc_dial.setMaximum(int(OPT_SETTINGS["bounds"]["fc"][1] * 100))
+            sf_fc_dial.setValue(int(sf_fc * 100))
+            sf_fc_dial.setEnabled(False)
+            sf_layout.addWidget(sf_fc_dial)
+
+            sf_fc_edit = QLineEdit(f"{sf_fc:.2f}")
+            sf_fc_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sf_fc_edit.setReadOnly(True)
+            sf_fc_edit.setStyleSheet(
+                "background-color: #2a1f00; border: 1px solid #ff9900; "
+                "border-radius: 3px; color: #ff9900;"
+            )
+            sf_layout.addWidget(sf_fc_edit)
+
+            # Q
+            q_lbl = QLabel("Q")
+            q_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            q_lbl.setStyleSheet("font-weight: bold; color: #d36cff;")
+            sf_layout.addWidget(q_lbl)
+
+            sf_q_dial = GlowDial(self, glow_color="#ff9900", accent_color="#ff9900")
+            sf_q_dial.setMinimum(int(OPT_SETTINGS["bounds"]["Q"][0] * 1000))
+            sf_q_dial.setMaximum(int(OPT_SETTINGS["bounds"]["Q"][1] * 1000))
+            sf_q_dial.setValue(int(sf_Q * 1000))
+            sf_q_dial.setEnabled(False)
+            sf_layout.addWidget(sf_q_dial)
+
+            sf_q_edit = QLineEdit(f"{sf_Q:.3f}")
+            sf_q_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sf_q_edit.setReadOnly(True)
+            sf_q_edit.setStyleSheet(
+                "background-color: #2a1f00; border: 1px solid #ff9900; "
+                "border-radius: 3px; color: #ff9900;"
+            )
+            sf_layout.addWidget(sf_q_edit)
+
+            # Gain
+            gain_color_sf = "#ff6666" if sf_gain < 0 else "#44ff88"
+            g_lbl = QLabel("Gain (dB)")
+            g_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            g_lbl.setStyleSheet(f"font-weight: bold; color: {gain_color_sf};")
+            sf_layout.addWidget(g_lbl)
+
+            sf_g_dial = GlowDial(self, glow_color="#ff9900", accent_color="#ff9900")
+            sf_g_dial.setMinimum(int(OPT_SETTINGS["bounds"]["gain_db"][0] * 100))
+            sf_g_dial.setMaximum(int(OPT_SETTINGS["bounds"]["gain_db"][1] * 100))
+            sf_g_dial.setValue(int(sf_gain * 100))
+            sf_g_dial.setEnabled(False)
+            sf_layout.addWidget(sf_g_dial)
+
+            sf_g_edit = QLineEdit(f"{sf_gain:.2f}")
+            sf_g_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sf_g_edit.setReadOnly(True)
+            sf_g_edit.setStyleSheet(
+                f"background-color: #2a1f00; border: 1px solid #ff9900; "
+                f"border-radius: 3px; color: {gain_color_sf};"
+            )
+            sf_layout.addWidget(sf_g_edit)
+
+            controls_layout.addLayout(sf_layout)
+
         main_layout.addLayout(controls_layout)
+
+    def _total_H(self, params=None, filter_states=None):
+        """Return combined complex response of variable + static filters over freqs_full."""
+        if params is None:
+            params = self.params
+        if filter_states is None:
+            filter_states = self.filter_states
+        H = total_response(params, self.z_full, self.fs, self.n_filters,
+                           self.use_high_shelf, self.use_low_shelf, filter_states)
+        if self.static_params_list:
+            H = H * static_filter_response(self.static_params_list, self.z_full, self.fs)
+        return H
 
     def update_param(self, idx, value, line_edit, format_str, scale):
         if self.is_optimizing:
@@ -723,12 +975,11 @@ class EQWindow(QMainWindow):
 
         line_edit.setText(format_str.format(value))
         self.dials[idx].setValue(int(value * scale))
-        H = total_response(self.params, self.z_full, self.fs, self.n_filters, self.use_high_shelf, self.use_low_shelf, self.filter_states)
+        H = self._total_H()
         mag_linear = np.abs(H)
         mag_db = 20.0 * np.log10(np.maximum(mag_linear, 1e-12))
         rmse_linear = np.sqrt(np.mean((mag_linear[self.fit_mask] - self.desired_linear_fit)**2))
         rmse_db = np.sqrt(np.mean((mag_db[self.fit_mask] - self.desired_db_fit)**2))
-        mag_db = 20.0 * np.log10(np.maximum(np.abs(H), 1e-12))
         corrected_db = self.meas_abs + mag_db
         error_db = corrected_db - self.target_abs
         self.eq_plot.setData(self.freqs_full, mag_db)
@@ -759,9 +1010,9 @@ class EQWindow(QMainWindow):
                 self.params[idx] = value
                 self.dials[idx].setValue(int(value * scale))
                 line_edit.setText(format_str.format(value))
-                H = total_response(self.params, self.z_full, self.fs, self.n_filters, self.use_high_shelf, self.use_low_shelf, self.filter_states)
+                H = self._total_H()
                 mag_linear = np.abs(H)
-                mag_db = 20.0 * np.log10(np.maximum(np.abs(H), 1e-12))
+                mag_db = 20.0 * np.log10(np.maximum(mag_linear, 1e-12))
                 corrected_db = self.meas_abs + mag_db
                 error_db = corrected_db - self.target_abs
                 self.eq_plot.setData(self.freqs_full, mag_db)
@@ -797,7 +1048,7 @@ class EQWindow(QMainWindow):
         print(f"Toggling filter {orig_idx+1}, new state: {not self.filter_states[idx]}")
         self.filter_states[idx] = not self.filter_states[idx]
         self.leds[idx].setStyleSheet(f"background-color: {'#44ff44' if self.filter_states[idx] else '#ff4444'}; border-radius: 6px; border: 1px solid #333;")
-        H = total_response(self.params, self.z_full, self.fs, self.n_filters, self.use_high_shelf, self.use_low_shelf, self.filter_states)
+        H = self._total_H()
         mag_linear = np.abs(H)
         mag_db = 20.0 * np.log10(np.maximum(np.abs(H), 1e-12))
         corrected_db = self.meas_abs + mag_db
@@ -833,11 +1084,15 @@ class EQWindow(QMainWindow):
         lb_full = self.lb.copy()
         ub_full = self.ub.copy()
 
-        # === 2. Build active params from GUI dials ===
+        # === 2. Build active (compact) params from GUI dials ===
+        # We keep the x vector compact (active filters only) so the optimizer
+        # only perturbs params that actually affect the objective.
+        # A closure (build_full_params) reconstructs the full n_filters*3 vector
+        # before every residuals() call so total_response can use its normal i*3
+        # indexing without any remapping inside residuals().
         active_params = []
         active_lb = []
         active_ub = []
-        active_indices = []
         x_scale = []
 
         for i in range(self.n_filters):
@@ -851,7 +1106,6 @@ class EQWindow(QMainWindow):
             active_params.extend([fc, q, g])
             active_lb.extend(lb_full[i*3:(i+1)*3])
             active_ub.extend(ub_full[i*3:(i+1)*3])
-            active_indices.extend([i*3, i*3+1, i*3+2])
             x_scale.extend([0.01, 0.001, 0.01])
 
         if not active_params:
@@ -874,15 +1128,79 @@ class EQWindow(QMainWindow):
             active_lb + 1e-12, active_ub - 1e-12
         )
 
+        # Snapshot of disabled-filter params so the closure can fill them in.
+        params_snapshot = self.params.copy()
+        _n   = self.n_filters
+        _fst = current_filter_states
+
+        def build_full_params(x_compact):
+            """Expand compact active-only x back to the full n_filters*3 vector."""
+            p = params_snapshot.copy()
+            j = 0
+            for i in range(_n):
+                if _fst[i]:
+                    p[i*3:(i+1)*3] = x_compact[j*3:(j+1)*3]
+                    j += 1
+            return p
+
+        # Precompute z1/z2 for the fit grid (avoids repeated ** inside residuals).
+        z1_fit_reopt = self.z_fit ** -1
+        z2_fit_reopt = self.z_fit ** -2
+
+        # Precompute the same constants the CLI path uses so residuals() never
+        # falls into the slow legacy branch during interactive reoptimization.
+        z_ref_reopt = np.exp(-1j * 2.0 * math.pi * self.ref_hz / self.fs)
+        z_ref_arr_reopt = np.array([z_ref_reopt])
+        if self.static_params_list and self.anchor_enable:
+            h_sta_ref_reopt = static_filter_response(
+                self.static_params_list, z_ref_arr_reopt, self.fs)[0]
+        else:
+            h_sta_ref_reopt = 1.0 + 0j
+        h_sta_ref_energy_reopt = (h_sta_ref_reopt.real**2 + h_sta_ref_reopt.imag**2
+                                  if hasattr(h_sta_ref_reopt, 'real')
+                                  else float(h_sta_ref_reopt)**2)
+
+        if self.static_params_list:
+            H_static_fit_reopt = static_filter_response(
+                self.static_params_list, self.z_fit, self.fs, z1_fit_reopt, z2_fit_reopt)
+            adjusted_desired_reopt = self.desired_linear_fit / np.maximum(
+                np.abs(H_static_fit_reopt), 1e-12)
+        else:
+            adjusted_desired_reopt = self.desired_linear_fit
+        desired_energy_reopt = adjusted_desired_reopt ** 2
+
+        z_fit_with_ref_reopt  = np.append(self.z_fit, z_ref_reopt)
+        z1_fit_with_ref_reopt = z_fit_with_ref_reopt ** -1
+        z2_fit_with_ref_reopt = z_fit_with_ref_reopt ** -2
+
         # === 3. Run optimizer ===
         res = None
         try:
             res = least_squares(
                 lambda x: residuals(
-                    x, self.z_fit, self.desired_linear_fit, self.n_filters,
-                    self.weight_fit, self.anchor_enable, self.anchor_weight,
-                    self.ref_hz, self.use_high_shelf, self.use_low_shelf,
-                    current_filter_states, self.fs
+                    build_full_params(x),          # always full-length
+                    self.z_fit,
+                    z1_fit_reopt,
+                    z2_fit_reopt,
+                    self.desired_linear_fit,
+                    self.n_filters,
+                    self.weight_fit,
+                    anchor_enable=self.anchor_enable,
+                    anchor_weight=self.anchor_weight,
+                    ref_hz=self.ref_hz,
+                    use_high_shelf=self.use_high_shelf,
+                    use_low_shelf=self.use_low_shelf,
+                    filter_states=current_filter_states,
+                    fs=self.fs,
+                    static_params=self.static_params_list,
+                    adjusted_desired=adjusted_desired_reopt,
+                    desired_energy=desired_energy_reopt,
+                    z_ref=z_ref_reopt,
+                    h_sta_ref=h_sta_ref_reopt,
+                    h_sta_ref_energy=h_sta_ref_energy_reopt,
+                    z_fit_with_ref=z_fit_with_ref_reopt,
+                    z1_fit_with_ref=z1_fit_with_ref_reopt,
+                    z2_fit_with_ref=z2_fit_with_ref_reopt,
                 )[0],
                 active_params,
                 bounds=(active_lb, active_ub),
@@ -893,7 +1211,7 @@ class EQWindow(QMainWindow):
                 jac='3-point', loss='soft_l1', method='trf'
             )
 
-            # Write back results to original order
+            # Write compact result back into full params using the same index mapping.
             j = 0
             for i in range(self.n_filters):
                 if current_filter_states[i]:
@@ -938,8 +1256,7 @@ class EQWindow(QMainWindow):
         new_orig_to_sorted = {orig: new for new, orig in enumerate(new_orig_idx)}
 
         # === 5. Evaluate new RMSE ===
-        H = total_response(new_params, self.z_full, self.fs, self.n_filters,
-                           self.use_high_shelf, self.use_low_shelf, new_states)
+        H = self._total_H(params=new_params, filter_states=new_states)
         mag_linear = np.abs(H)
         mag_db = 20.0 * np.log10(np.maximum(mag_linear, 1e-12))
         rmse_linear = np.sqrt(np.mean((mag_linear[self.fit_mask] - self.desired_linear_fit)**2))
@@ -1041,8 +1358,7 @@ class EQWindow(QMainWindow):
                 self.dials[i*3+2].update()
 
             # Recompute best curve
-            H = total_response(self.params, self.z_full, self.fs, self.n_filters,
-                               self.use_high_shelf, self.use_low_shelf, self.filter_states)
+            H = self._total_H()
             mag_db = 20.0 * np.log10(np.maximum(np.abs(H), 1e-12))
             corrected_db = self.meas_abs + mag_db
             error_db = corrected_db - self.target_abs
@@ -1056,10 +1372,7 @@ class EQWindow(QMainWindow):
 
     def closeEvent(self, event):
         # Recompute EQ response with best parameters
-        H = total_response(
-            self.best_params, self.z_full, self.fs, self.n_filters,
-            self.use_high_shelf, self.use_low_shelf, self.best_filter_states
-        )
+        H = self._total_H(params=self.best_params, filter_states=self.best_filter_states)
         mag_linear = np.abs(H)
         mag_db = 20.0 * np.log10(np.maximum(mag_linear, 1e-12))
 
@@ -1120,8 +1433,57 @@ class EQWindow(QMainWindow):
                 line = f"Filter {i+1}: {state} {t} Fc {fc:.2f} Hz Gain {g:.2f} dB Q {Q:.3f}\n"
                 f.write(line)
                 print(line.rstrip())
+            # Append static filter with clear marker
+            if self.parsed_static_filter:
+                sf_type, sf_fc, sf_Q, sf_gain = self.parsed_static_filter
+                n = len(filters) + 1
+                line = (f"Filter {n}: ON {sf_type} Fc {sf_fc:.2f} Hz "
+                        f"Gain {sf_gain:.2f} dB Q {sf_Q:.3f}  # STATIC (pinned)\n")
+                f.write(line)
+                print(line.rstrip())
 
         event.accept()
+
+def run(target_freq, target_mag, extra_args=None):
+    """Call acoustiq's full pipeline with target curve supplied as arrays.
+
+    Skips the CSV write/read round-trip that process_point previously needed.
+    All other behaviour (optimizer, output file, plot) is identical to main().
+
+    Parameters
+    ----------
+    target_freq : array-like  -- frequency axis of the target curve (Hz)
+    target_mag  : array-like  -- magnitude axis of the target curve (dB)
+    extra_args  : list[str]   -- additional CLI args, e.g. ["-tl", "0.500"]
+                                 Do NOT include --target / -t; it is ignored.
+    """
+    import sys as _sys
+    base = [_sys.argv[0]]
+    if extra_args:
+        base += extra_args
+    # Parse the args as usual so every flag is honoured.
+    # We then inject the arrays so main() skips the file load.
+    _saved = _sys.argv
+    _sys.argv = base
+    try:
+        # Re-use main() but inject the target arrays before CSV loading.
+        import argparse as _ap
+        # We call main() after patching args._target_freq/_target_mag via a
+        # monkeypatch on ArgumentParser.parse_args so no duplication is needed.
+        _orig_parse = _ap.ArgumentParser.parse_args
+        def _patched_parse(self, *a, **kw):
+            ns = _orig_parse(self, *a, **kw)
+            ns._target_freq = target_freq
+            ns._target_mag  = target_mag
+            return ns
+        _ap.ArgumentParser.parse_args = _patched_parse
+        try:
+            return main()
+        finally:
+            _ap.ArgumentParser.parse_args = _orig_parse
+    finally:
+        _sys.argv = _saved
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1132,7 +1494,7 @@ def main():
     )
 
     parser.add_argument("-s", "--source", required=True, help="Source CSV (freq, dB)")
-    parser.add_argument("-t", "--target", required=True, help="Target CSV (freq, dB)")
+    parser.add_argument("-t", "--target", required=False, default=None, help="Target CSV (freq, dB)")
     parser.add_argument("-o", "--output", default="fitted_filters.txt", help="Output text file for filter parameters")
     parser.add_argument("-co", "--corrected-output", help="Output CSV file for corrected measurement (freq, dB)")
     parser.add_argument("-fi", "--filter-input", help="Input text file with initial filter parameters (e.g., fitted_filters.txt)")
@@ -1155,11 +1517,47 @@ def main():
     parser.add_argument("-sdo", "--shelf-drift-oct", type=float, default=0.3, help="Allowed ±octave drift for shelf center during optimization (default: 0.3)")
     parser.add_argument("-sw", "--shelf-weight", type=float, default=1.0, help="Weight multiplier for the shelf region (default: 1.0)")
     parser.add_argument("-flb", "--fc-bounds-low-shelf", type=str, help="Frequency bounds for low-shelf filter, e.g. '100,800'")
+    parser.add_argument("-fm1", "--filter-mask1", type=str, metavar="CENTER,WIDTH,DEPTH", help="Suppression mask 1: center_hz,width_hz,depth_db  (e.g. 3150,2000,26)")
+    parser.add_argument("-fm2", "--filter-mask2", type=str, metavar="CENTER,WIDTH,DEPTH", help="Suppression mask 2: same format as -fm1  (e.g. 9550,4000,34)")
     parser.add_argument("-tl", "--tilt", type=float, default=0.0, help="Apply tilt (dB/oct) to target curve relative to ref_hz (default: 0.0)")
     parser.add_argument("-np", "--no-plot", action="store_true", help="Disable visualization")
+    parser.add_argument("-no", "--no-output", action="store_true",
+                        help="Skip writing the EQ output file (return filters in-memory only)")
+    parser.add_argument("--save-plot", type=str, default=None, metavar="PATH",
+                        help="Save the final plot as a PNG image to this path (e.g. HD560S.png)")
+    parser.add_argument("--hide-traces", type=str, default=None, metavar="NAMES",
+                        help="Comma-separated trace names to hide in the plot (e.g. 'Target,Error Curve,Residual')")
     parser.add_argument("-i", "--interactive", action="store_true", help="Enable interactive knob adjustment of filters (uses PyQt6)")
+    parser.add_argument("-sf", "--static-filter", type=str, metavar="TYPE,FC,Q,GAIN",
+                        help="Define one static (pinned) filter the optimizer cannot change. "
+                             "Format: TYPE,Fc_Hz,Q,Gain_dB  e.g. 'PK,1000,0.707,-3.5' or 'HS,8000,0.5,2.0'. "
+                             "TYPE is PK, HS, or LS. The filter is inserted into the stack at its natural "
+                             "Fc position and held fixed during all optimization passes.")
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Parse --static-filter  (TYPE,Fc,Q,Gain)
+    # ------------------------------------------------------------------
+    parsed_static_filter = None  # Will be (ftype, fc, Q, gain_db) or None
+    if args.static_filter:
+        try:
+            parts = [p.strip() for p in args.static_filter.split(',')]
+            if len(parts) != 4:
+                raise ValueError("Expected exactly 4 comma-separated values: TYPE,FC,Q,GAIN")
+            sf_type = parts[0].upper()
+            if sf_type not in ('PK', 'HS', 'LS'):
+                raise ValueError(f"TYPE must be PK, HS, or LS — got '{sf_type}'")
+            sf_fc   = float(parts[1])
+            sf_Q    = float(parts[2])
+            sf_gain = float(parts[3])
+            if sf_fc <= 0:
+                raise ValueError("Fc must be > 0")
+            parsed_static_filter = (sf_type, sf_fc, sf_Q, sf_gain)
+            print(f"\n[STATIC FILTER] Pinned: {sf_type} Fc={sf_fc:.2f} Hz  Q={sf_Q:.3f}  Gain={sf_gain:.2f} dB")
+            print("  → This filter will be EXCLUDED from all optimization passes.\n")
+        except Exception as e:
+            error_exit(f"Invalid --static-filter '{args.static_filter}': {e}")
 
     if args.fs:
         OPT_SETTINGS["fs"] = args.fs
@@ -1277,7 +1675,6 @@ def main():
 
     try:
         df_meas = pd.read_csv(args.source)
-        df_tgt = pd.read_csv(args.target)
     except pd.errors.EmptyDataError:
         error_exit("Input CSV file is empty or contains no valid data.")
     except FileNotFoundError as e:
@@ -1285,16 +1682,38 @@ def main():
     except Exception as e:
         error_exit(f"Failed to read input CSV file: {str(e)}")
 
-    if df_meas.shape[1] < 2 or df_tgt.shape[1] < 2:
-        error_exit("Input CSV files must have at least two columns (frequency and dB).")
+    if df_meas.shape[1] < 2:
+        error_exit("Source CSV must have at least two columns (frequency and dB).")
 
     try:
         fm = pd.to_numeric(df_meas.iloc[:, 0], errors='raise').to_numpy()
         ym = pd.to_numeric(df_meas.iloc[:, 1], errors='raise').to_numpy()
-        ft = pd.to_numeric(df_tgt.iloc[:, 0], errors='raise').to_numpy()
-        yt = pd.to_numeric(df_tgt.iloc[:, 1], errors='raise').to_numpy()
-    except ValueError as e:
-        error_exit("Input CSV files must contain numeric values in the first two columns (frequency and dB).")
+    except ValueError:
+        error_exit("Source CSV must contain numeric values in the first two columns (frequency and dB).")
+
+    # Target: accept injected arrays (fast path) or load from file
+    _injected_target = getattr(args, '_target_freq', None)
+    if _injected_target is not None:
+        ft = np.asarray(args._target_freq, dtype=float)
+        yt = np.asarray(args._target_mag,  dtype=float)
+    else:
+        if args.target is None:
+            error_exit("Either --target or injected _target_freq/_target_mag must be provided.")
+        try:
+            df_tgt = pd.read_csv(args.target)
+        except pd.errors.EmptyDataError:
+            error_exit("Target CSV file is empty or contains no valid data.")
+        except FileNotFoundError as e:
+            error_exit(f"Target CSV file not found: {str(e)}")
+        except Exception as e:
+            error_exit(f"Failed to read target CSV file: {str(e)}")
+        if df_tgt.shape[1] < 2:
+            error_exit("Target CSV must have at least two columns (frequency and dB).")
+        try:
+            ft = pd.to_numeric(df_tgt.iloc[:, 0], errors='raise').to_numpy()
+            yt = pd.to_numeric(df_tgt.iloc[:, 1], errors='raise').to_numpy()
+        except ValueError:
+            error_exit("Target CSV must contain numeric values in the first two columns (frequency and dB).")
 
     if not (np.all(np.isfinite(fm)) and np.all(np.isfinite(ym)) and np.all(np.isfinite(ft)) and np.all(np.isfinite(yt))):
         error_exit("Input CSV files must contain finite frequency and dB values.")
@@ -1367,7 +1786,7 @@ def main():
             meas_abs = meas_interp
             target_abs = tgt_interp
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=freqs_full, y=meas_abs, mode='lines', name='Measurement',
+            fig.add_trace(go.Scatter(x=freqs_full, y=meas_abs, mode='lines', name=os.path.splitext(os.path.basename(args.source))[0],
                                     line=dict(color='deepskyblue')))
             fig.add_trace(go.Scatter(x=freqs_full, y=target_abs, mode='lines', name='Target',
                                     line=dict(color='gold')))
@@ -1418,18 +1837,23 @@ def main():
     # Then continue with creating z_fit and z_full
     z_fit = np.exp(-1j * 2.0 * math.pi * freqs_fit / OPT_SETTINGS["fs"])
     z_full = np.exp(-1j * 2.0 * math.pi * freqs_full / OPT_SETTINGS["fs"])
-    try:
-        low_p, high_p = np.percentile(desired_db, [5.0, 95.0])
-    except Exception:
-        low_p, high_p = np.min(desired_db), np.max(desired_db)
+    if args.gain_bounds:
+        # User explicitly specified -gb: honour it exactly, skip adaptive logic.
+        gain_min, gain_max = OPT_SETTINGS["bounds"]["gain_db"]
+        print(f"Gain bounds (user-specified): ({gain_min:.2f}, {gain_max:.2f}) dB")
+    else:
+        try:
+            low_p, high_p = np.percentile(desired_db, [5.0, 95.0])
+        except Exception:
+            low_p, high_p = np.min(desired_db), np.max(desired_db)
 
-    buffer_db = 3.0
-    gain_min = math.floor((low_p - buffer_db) * 10.0) / 10.0
-    gain_max = math.ceil((high_p + buffer_db) * 10.0) / 10.0
-    gain_min = max(gain_min, -24.0)
-    gain_max = min(gain_max, 24.0)
-    OPT_SETTINGS["bounds"]["gain_db"] = (gain_min, gain_max)
-    print(f"Adaptive gain bounds (percentile-based): ({gain_min:.2f}, {gain_max:.2f}) dB")
+        buffer_db = 3.0
+        gain_min = math.floor((low_p - buffer_db) * 10.0) / 10.0
+        gain_max = math.ceil((high_p + buffer_db) * 10.0) / 10.0
+        gain_min = max(gain_min, -24.0)
+        gain_max = min(gain_max, 24.0)
+        OPT_SETTINGS["bounds"]["gain_db"] = (gain_min, gain_max)
+        print(f"Adaptive gain bounds (percentile-based): ({gain_min:.2f}, {gain_max:.2f}) dB")
 
     if args.filter_input and args.interactive:
         p0, lb, ub, filter_states = parse_filter_file(args.filter_input, n_filters, use_high_shelf, use_low_shelf)
@@ -1564,6 +1988,10 @@ def main():
     weight_fit = 1.0 + abs_dev_linear/max_abs_dev_linear
     weight_fit = smooth_vector(weight_fit, kernel_size)
 
+    weight_fit *= apply_custom_filter_masks(freqs_fit,
+                                             mask1_str=args.filter_mask1,
+                                             mask2_str=args.filter_mask2)
+
     rolloff = 1.0 / (1.0 + (freqs_fit / fc_peaks_high)**4)
     # ---- low-shelf weighting ------------------------------------------------
     if use_low_shelf:
@@ -1581,10 +2009,65 @@ def main():
     weight_fit = np.maximum(weight_fit, 1e-6)
 
     if not (args.filter_input and args.interactive):
+        # Build the static_params list for the residuals function
+        static_params_list = [parsed_static_filter] if parsed_static_filter else None
+
+        # ── Precompute constants that never change across optimizer iterations ──
+        z1_fit = z_fit ** -1
+        z2_fit = z_fit ** -2
+
+        # Fix 1: precompute z_ref once
+        z_ref = np.exp(-1j * 2.0 * math.pi * ref_hz / OPT_SETTINGS["fs"])
+
+        # Fix 1: precompute static response at ref_hz once
+        z_ref_arr = np.array([z_ref])
+        if static_params_list and anchor_enable:
+            h_sta_ref = static_filter_response(static_params_list, z_ref_arr, OPT_SETTINGS["fs"])[0]
+        else:
+            h_sta_ref = 1.0 + 0j
+        # Precompute |h_sta_ref|^2 once — used every residuals() call in the anchor term
+        h_sta_ref_energy = h_sta_ref.real**2 + h_sta_ref.imag**2 if hasattr(h_sta_ref, 'real') else float(h_sta_ref)**2
+
+        # Fix 3: precompute adjusted_desired once (removes static filter from target)
+        if static_params_list:
+            H_static_fit = static_filter_response(static_params_list, z_fit, OPT_SETTINGS["fs"],
+                                                  z1_fit, z2_fit)
+            mag_static_fit = np.abs(H_static_fit)
+            adjusted_desired = desired_linear_fit / np.maximum(mag_static_fit, 1e-12)
+        else:
+            adjusted_desired = desired_linear_fit
+
+        # Fix 5: precompute desired_energy once — constant across all iterations
+        desired_energy = adjusted_desired ** 2
+
+        # Fix 1: append z_ref to z_fit so total_response evaluates both in one call
+        z_fit_with_ref  = np.append(z_fit, z_ref)
+        z1_fit_with_ref = z_fit_with_ref ** -1
+        z2_fit_with_ref = z_fit_with_ref ** -2
+
+        # NOTE: do NOT pre-allocate a shared 'out' buffer and pass it here.
+        # scipy's 3-point Jacobian calls the lambda twice per parameter (f_plus and
+        # f_minus) and immediately diffs the two return values.  If both calls return
+        # a reference to the *same* numpy array, the second call overwrites the buffer
+        # before the diff is computed, making f_plus is f_minus (same object) and
+        # (f_plus - f_minus) = 0 everywhere — a zero Jacobian — so the optimizer has
+        # no gradient information and cannot fit the filters at all.
+        # Letting residuals() allocate a fresh array on every call (out=None default)
+        # gives each call its own independent array, which is what scipy requires.
+
         res = least_squares(
-            lambda x: residuals(x, z_fit, desired_linear_fit, n_filters,
+            lambda x: residuals(x, z_fit, z1_fit, z2_fit, desired_linear_fit, n_filters,
                               weight_fit, anchor_enable, anchor_weight, ref_hz,
-                              use_high_shelf, use_low_shelf, filter_states, OPT_SETTINGS["fs"])[0],
+                              use_high_shelf, use_low_shelf, filter_states, OPT_SETTINGS["fs"],
+                              static_params=static_params_list,
+                              adjusted_desired=adjusted_desired,
+                              desired_energy=desired_energy,
+                              z_ref=z_ref,
+                              h_sta_ref=h_sta_ref,
+                              h_sta_ref_energy=h_sta_ref_energy,
+                              z_fit_with_ref=z_fit_with_ref,
+                              z1_fit_with_ref=z1_fit_with_ref,
+                              z2_fit_with_ref=z2_fit_with_ref)[0],
             p0,
             bounds=(lb, ub),
             max_nfev=OPT_SETTINGS["maxiter"],
@@ -1592,7 +2075,7 @@ def main():
             xtol=1e-9,
             ftol=1e-9,
             gtol=1e-9,
-            jac='3-point',
+            jac='3-point',   # central difference: 2 evals/param, more accurate than '2-point' (1 eval/param, forward diff)
             loss='soft_l1',
             method='trf'
         )
@@ -1601,33 +2084,23 @@ def main():
             print(f"Warning: Optimizer did not converge: {res.message}. Results may be suboptimal.")
         p0 = res.x
 
-    # --- BUILD filter_data LIKE GUI ---
-    filter_data = []
+    # Build filter types directly -- the filter_data intermediate was dead code
+    filter_types = []
     for i in range(n_filters):
-        fc = p0[i*3]
-        is_low_shelf = use_low_shelf and i == 0
+        is_low_shelf  = use_low_shelf  and i == 0
         is_high_shelf = use_high_shelf and i == (n_filters - 1)
-        typ = 'LS' if is_low_shelf else 'HS' if is_high_shelf else 'PK'
-        filter_data.append((
-            fc,
-            p0[i*3:(i+1)*3],
-            lb[i*3:(i+1)*3],
-            ub[i*3:(i+1)*3],
-            filter_states[i] if filter_states is not None else True,
-            i,
-            typ
-        ))
+        filter_types.append('LS' if is_low_shelf else 'HS' if is_high_shelf else 'PK')
 
-    # Extract types
-    filter_types = [f[6] for f in filter_data]
-
-    # Now print
     filters = pretty_filters_from_params(p0, n_filters, filter_states, filter_types)
 
     p_opt = res.x
     fs = OPT_SETTINGS["fs"]
 
     H_opt = total_response(p_opt, z_full, fs, n_filters, use_high_shelf, use_low_shelf, filter_states)
+    # Add static filter contribution to the displayed EQ curve
+    if parsed_static_filter:
+        H_static_full = static_filter_response([parsed_static_filter], z_full, fs)
+        H_opt = H_opt * H_static_full
     mag_opt_linear = np.abs(H_opt)
     mag_opt_db = 20.0 * np.log10(np.maximum(mag_opt_linear, 1e-12))
 
@@ -1648,27 +2121,45 @@ def main():
 
     print(f"\nOptimization done:")
 
-    with open(args.output, "w") as fo:
-        fo.write(f"# Target: {args.target}\n")
-        fo.write(f"# Source: {args.source}\n")
-        fo.write(f"# RMS_error_linear_fit_region: {rms_fit_linear:.6f}")
-        fo.write(f"# RMS_error_dB_fit_region:     {rms_fit_db:.6f}")
-        fo.write(f"# RMS_error_linear_full_band:  {rms_full_linear:.6f}")
-        fo.write(f"# RMS_error_dB_full_band:      {rms_full_db:.6f}")
-        print(f"# Target: {args.target}")
-        print(f"# Source: {args.source}")
-        print(f"# RMS_error_linear_fit_region: {rms_fit_linear:.6f}")
-        print(f"# RMS_error_dB_fit_region:     {rms_fit_db:.6f}")
-        print(f"# RMS_error_linear_full_band:  {rms_full_linear:.6f}")
-        print(f"# RMS_error_dB_full_band:      {rms_full_db:.6f}")
-        max_gain_db = np.max(mag_opt_db)
-        preamp_db = -max_gain_db
-        fo.write(f"Preamp: {preamp_db:.1f} dB\n")
-        print(f"Preamp: {preamp_db:.1f} dB")
-        for i, (typ, fc, Q, g, state) in enumerate(filters, start=1):
-            line = f"Filter {i}: {state} {typ} Fc {fc:.2f} Hz Gain {g:.2f} dB Q {Q:.3f}\n"
-            fo.write(line)
-            print(line, end="")
+    max_gain_db = np.max(mag_opt_db)
+    preamp_db   = round(-max_gain_db, 1)   # match file precision (:.1f)
+
+    if not getattr(args, "no_output", False):
+        with open(args.output, "w") as fo:
+            fo.write(f"# Target: {args.target}\n")
+            fo.write(f"# Source: {args.source}\n")
+            fo.write(f"# RMS_error_linear_fit_region: {rms_fit_linear:.6f}\n")
+            fo.write(f"# RMS_error_dB_fit_region:     {rms_fit_db:.6f}\n")
+            fo.write(f"# RMS_error_linear_full_band:  {rms_full_linear:.6f}\n")
+            fo.write(f"# RMS_error_dB_full_band:      {rms_full_db:.6f}\n")
+            print(f"# Target: {args.target}")
+            print(f"# Source: {args.source}")
+            print(f"# RMS_error_linear_fit_region: {rms_fit_linear:.6f}")
+            print(f"# RMS_error_dB_fit_region:     {rms_fit_db:.6f}")
+            print(f"# RMS_error_linear_full_band:  {rms_full_linear:.6f}")
+            print(f"# RMS_error_dB_full_band:      {rms_full_db:.6f}")
+            fo.write(f"Preamp: {preamp_db:.1f} dB\n")
+            print(f"Preamp: {preamp_db:.1f} dB")
+            filter_number = 1
+            for i, (typ, fc, Q, g, state) in enumerate(filters):
+                line = f"Filter {filter_number}: {state} {typ} Fc {fc:.2f} Hz Gain {g:.2f} dB Q {Q:.3f}\n"
+                fo.write(line)
+                print(line, end="")
+                filter_number += 1
+            if parsed_static_filter:
+                sf_type, sf_fc, sf_Q, sf_gain = parsed_static_filter
+                line = (f"Filter {filter_number}: ON {sf_type} Fc {sf_fc:.2f} Hz "
+                        f"Gain {sf_gain:.2f} dB Q {sf_Q:.3f}  # STATIC (pinned)\n")
+                fo.write(line)
+                print(line, end="")
+
+    # Return in-memory result rounded to file precision (Fc .2f, Gain .2f, Q .3f)
+    # so in-memory scoring is numerically identical to the file-then-parse path.
+    filter_tuples = [(round(fc, 2), round(g, 2), round(Q, 3))
+                     for (typ, fc, Q, g, state) in filters if state == "ON"]
+    if parsed_static_filter:
+        sf_type, sf_fc, sf_Q, sf_gain = parsed_static_filter
+        filter_tuples.append((round(sf_fc, 2), round(sf_gain, 2), round(sf_Q, 3)))
 
     if not args.no_plot:
         if args.interactive and n_filters > 0:
@@ -1693,22 +2184,26 @@ def main():
                 fc_low_shelf_low=fc_low_shelf_low if use_low_shelf else None,
                 fc_low_shelf_high=fc_low_shelf_high if use_low_shelf else None,
                 fc_shelf_low=fc_shelf_low if use_high_shelf else None,
-                fc_shelf_high=fc_shelf_high if use_high_shelf else None
+                fc_shelf_high=fc_shelf_high if use_high_shelf else None,
+                parsed_static_filter=parsed_static_filter,
             )
             window.show()
             app.exec()
         else:
+            hidden = set(t.strip() for t in args.hide_traces.split(",")) if args.hide_traces else set()
+            def _vis(name): return 'legendonly' if name in hidden else True
+
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=freqs_full, y=meas_abs, mode='lines', name='Measurement',
+            fig.add_trace(go.Scatter(x=freqs_full, y=meas_abs, mode='lines', name=os.path.splitext(os.path.basename(args.source))[0],
                                     line=dict(color='deepskyblue')))
             fig.add_trace(go.Scatter(x=freqs_full, y=target_abs, mode='lines', name='Target',
-                                    line=dict(color='gold')))
+                                    line=dict(color='gold'), visible=_vis('Target')))
             fig.add_trace(go.Scatter(x=freqs_full, y=eq_curve_db, mode='lines', name='EQ Curve',
                                     line=dict(color='dodgerblue')))
-            fig.add_trace(go.Scatter(x=freqs_full, y=corrected_db, mode='lines', name='Corrected Measurement',
+            fig.add_trace(go.Scatter(x=freqs_full, y=corrected_db, mode='lines', name='Corrected',
                                     line=dict(color='lime', dash='dot')))
             fig.add_trace(go.Scatter(x=freqs_full, y=error_curve_db, mode='lines', name='Error Curve',
-                                    line=dict(color='orange', dash='dash')))
+                                    line=dict(color='orange', dash='dash'), visible=_vis('Error Curve')))
             fig.add_trace(go.Scatter(
                 x=np.concatenate([freqs_full, freqs_full[::-1]]),
                 y=np.concatenate([target_abs, corrected_db[::-1]]),
@@ -1717,7 +2212,8 @@ def main():
                 line=dict(color='rgba(0,0,0,0)'),
                 hoverinfo='skip',
                 showlegend=True,
-                name='Residual'
+                name='Residual',
+                visible=_vis('Residual'),
             ))
             fig.add_vline(x=fc_peaks_low, line=dict(color='white', dash='dash'),
                         annotation_text=f"Peaks low: {fc_peaks_low:.0f} Hz", annotation_position="top left")
@@ -1740,20 +2236,31 @@ def main():
             if use_high_shelf:
                 title_text += f", shelf {fc_shelf_low:.0f}-{fc_shelf_high:.0f} Hz"
             if tilt_slope is not None:
-                title_text += f", tilt {tilt_slope:.4f} dB/oct relative to {ref_hz} Hz"
+                title_text += f", tilt {tilt_slope:.3f} dB/oct relative to {ref_hz} Hz"
             title_text += ")"
 
             fig.update_layout(
-                title=title_text,
+                width=1400,
+                height=900,
+                title=dict(
+                    text=title_text,
+                    subtitle=dict(text=os.path.splitext(os.path.basename(args.source))[0])
+                ),
                 xaxis=dict(title='Frequency (Hz)', type='log', range=[math.log10(min_freq), math.log10(max_freq)], autorange=False),
                 yaxis=dict(title='Amplitude (dB)'),
                 legend=dict(x=1.05, y=1.05, xanchor='right', yanchor='top'),
                 template="plotly_dark"
             )
 
+            #fig.write_image("plot.svg")
+            if args.save_plot:
+                fig.write_image(args.save_plot)
+                print(f"Plot saved to {args.save_plot}")
             fig.show(config=dict(editable=True))
     else:
         print("Plotting disabled by --no-plot flag.")
+
+    return preamp_db, filter_tuples
 
 if __name__ == "__main__":
     main()
