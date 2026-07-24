@@ -44,7 +44,10 @@ AcoustiQ optimizes in the **energy domain** (magnitude squared), where errors ar
 ## Features
 
 - **Energy Domain Optimization**: Perceptually accurate results with raw, unsmoothed data
+- **JIT-Accelerated Hot Path**: Numba-compiled biquad kernels cut per-iteration cost to near-C speed
 - **Intelligent Filter Fitting**: Fits peaking, low-shelf, and high-shelf IIR biquad filters to correction curves
+- **Static Pinned Filters**: Lock one filter at fixed parameters the optimizer cannot touch — useful for known corrections (e.g. a measured headphone driver peak)
+- **Optimizer Suppression Masks**: Suppress optimizer weight in up to two frequency bands to ignore problem regions (e.g. measurement artefacts, windowing nulls)
 - **Interactive GUI**: Professional mixer-style knobs with real-time EQ adjustment (PyQt6)
 - **Filter Management**: Toggle filters on/off, adjust parameters with visual feedback
 - **Adaptive Bounds**: Automatic gain bounds based on target curve characteristics
@@ -52,7 +55,7 @@ AcoustiQ optimizes in the **energy domain** (magnitude squared), where errors ar
 - **Anchor Point**: Optional normalization at reference frequency (default: 1 kHz)
 - **Target Tilt**: Apply frequency-dependent tilt to target curves
 - **Multiple Output Formats**: Text filter parameters + corrected measurement CSV
-- **Visualization**: Plotly plots showing measurement, target, EQ curve, corrected response, and error
+- **Visualization**: Plotly plots showing measurement, target, EQ curve, corrected response, and residuals
 
 ---
 
@@ -61,8 +64,14 @@ AcoustiQ optimizes in the **energy domain** (magnitude squared), where errors ar
 ### Requirements
 
 ```bash
-pip install numpy pandas scipy plotly pyqt6 pyqtgraph
+pip install numpy pandas scipy plotly pyqt6 pyqtgraph numba
 ```
+
+### Companion File
+
+`acoustiq_kernels.py` must be placed in the **same directory** as `acoustiq.py`. It contains the Numba JIT kernels for the optimization hot path. Both files are required.
+
+On first run, Numba compiles the kernels and writes `.nbi`/`.nbc` cache files next to `acoustiq_kernels.py`. All subsequent runs — including spawned worker processes — load from disk in milliseconds.
 
 ### Dependencies
 
@@ -73,6 +82,7 @@ pip install numpy pandas scipy plotly pyqt6 pyqtgraph
 - Plotly: Interactive plotting
 - PyQt6: GUI framework
 - PyQtGraph: Real-time plot updates
+- Numba: JIT compilation of frequency-response kernels
 
 ---
 
@@ -125,12 +135,12 @@ python acoustiq.py \
 
 ## Command-Line Arguments
 
-### Required Arguments
+### Source and Target
 
-| Argument | Description |
-|----------|-------------|
-| `-s, --source` | Source measurement CSV file (frequency, dB) |
-| `-t, --target` | Target response CSV file (frequency, dB) |
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `-s, --source` | **Yes** | Source measurement CSV file (frequency, dB) |
+| `-t, --target` | **Yes** (CLI) | Target response CSV file (frequency, dB). Marked optional in the parser to support programmatic use where target arrays are injected directly into `main()` — omitting it on the command line is an error. |
 
 ### Filter Configuration
 
@@ -140,15 +150,16 @@ python acoustiq.py \
 | `-hs, --high-shelf` | None | High-shelf center frequency (Hz) |
 | `-ls, --low-shelf` | None | Low-shelf center frequency (Hz) |
 | `-sdo, --shelf-drift-oct` | 0.3 | Allowed octave drift for shelf filters |
+| `-sf, --static-filter` | None | Pinned filter the optimizer cannot change. Format: `TYPE,Fc_Hz,Q,Gain_dB` — e.g. `'PK,1000,0.707,-3.5'` or `'HS,8000,0.5,2.0'`. TYPE is `PK`, `HS`, or `LS`. |
 
 ### Frequency Bounds
 
 | Argument | Description |
 |----------|-------------|
-| `-fb, --fc-bounds` | Global frequency bounds for all filters (e.g., '30,16000') |
-| `-fbp, --fc-bounds-peaks` | Frequency bounds for peaking filters (e.g., '20,1000') |
-| `-fbs, --fc-bounds-shelf` | Frequency bounds for high-shelf (e.g., '3000,20000') |
-| `-flb, --fc-bounds-low-shelf` | Frequency bounds for low-shelf (e.g., '100,800') |
+| `-fb, --fc-bounds` | Global frequency bounds for all filters (e.g., `'30,16000'`) |
+| `-fbp, --fc-bounds-peaks` | Frequency bounds for peaking filters (e.g., `'20,1000'`) |
+| `-fbs, --fc-bounds-shelf` | Frequency bounds for high-shelf (e.g., `'3000,20000'`) |
+| `-flb, --fc-bounds-low-shelf` | Frequency bounds for low-shelf (e.g., `'100,800'`) |
 
 ### Parameter Bounds
 
@@ -157,6 +168,15 @@ python acoustiq.py \
 | `-qb, --Q-bounds` | (0.1, 10.0) | Q bounds for peaking filters |
 | `-sqb, --shelf-q-bounds` | (0.01, 1.0) | Q bounds for shelf filters |
 | `-gb, --gain-bounds` | Adaptive | Gain bounds in dB (auto-calculated from target) |
+
+### Optimizer Suppression Masks
+
+Suppression masks reduce the optimizer's fitting weight in a rectangular frequency band without disabling it entirely. Use these to tell the optimizer "don't try hard here" — for example around a measurement artefact, windowing null, or known resonance you don't want EQ'd.
+
+| Argument | Metavar | Description |
+|----------|---------|-------------|
+| `-fm1, --filter-mask1` | `CENTER,WIDTH,DEPTH` | Suppression mask 1: center Hz, width Hz, depth dB. E.g. `'3150,2000,26'` suppresses weight in the 2150–4150 Hz band by 26 dB. |
+| `-fm2, --filter-mask2` | `CENTER,WIDTH,DEPTH` | Suppression mask 2: same format as `-fm1`. |
 
 ### Optimization Settings
 
@@ -177,13 +197,16 @@ python acoustiq.py \
 | `-co, --corrected-output` | None | Output corrected measurement CSV |
 | `-fi, --filter-input` | None | Input filter file for initial parameters |
 | `-f, --freqs` | None | Custom frequency grid (comma-separated) |
+| `-no, --no-output` | False | Skip writing the output file (in-memory result only) |
 
 ### Visualization
 
-| Argument | Description |
-|----------|-------------|
-| `-i, --interactive` | Enable interactive PyQt6 GUI |
-| `-np, --no-plot` | Disable all visualization |
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-i, --interactive` | False | Enable interactive PyQt6 GUI |
+| `-np, --no-plot` | False | Disable all visualization |
+| `--save-plot` | None | Save the final Plotly plot as an image (e.g. `HD560S.png`) |
+| `--hide-traces` | None | Comma-separated trace names to hide initially (e.g. `'Target,Error Curve,Residual'`) |
 
 ### Advanced
 
@@ -228,19 +251,27 @@ frequency,raw
 
 ### Filter Parameters File
 
-Text file with filter specifications in parametric EQ format:
+Text file with filter specifications in parametric EQ format. The RMSE header reports both fit-region and full-band error in linear and dB domains:
 
 ```
 # Target: target.csv
 # Source: measurement.csv
-# RMS_error_linear: 0.0234
-# RMS_error_dB: 0.85
+# RMS_error_linear_fit_region: 0.023412
+# RMS_error_dB_fit_region:     0.854321
+# RMS_error_linear_full_band:  0.031056
+# RMS_error_dB_full_band:      1.123456
 Preamp: -6.2 dB
 Filter 1: ON LS Fc 120.45 Hz Gain -2.34 dB Q 0.450
-Filter 2: ON PK Fc 215.67 Hz Gain 3.21 dB Q 1.234
+Filter 2: ON PK Fc 215.67 Hz Gain  3.21 dB Q 1.234
 Filter 3: ON PK Fc 487.23 Hz Gain -4.56 dB Q 2.150
 ...
-Filter 9: ON HS Fc 8234.12 Hz Gain 5.67 dB Q 0.650
+Filter 9: ON HS Fc 8234.12 Hz Gain  5.67 dB Q 0.650
+```
+
+Filters are written in ascending frequency order. If a static pinned filter was specified with `-sf`, it appears at the end with a `# STATIC (pinned)` marker:
+
+```
+Filter 10: ON PK Fc 1000.00 Hz Gain -3.50 dB Q 0.707  # STATIC (pinned)
 ```
 
 ### Corrected Measurement CSV
@@ -266,6 +297,7 @@ frequency,raw
 - **Filter Toggle**: Click filter labels to enable/disable (green/red LED indicators)
 - **Editable Fields**: QLineEdit boxes below each knob for precise entry (press Enter to apply)
 - **Parameter Labels**: Color-coded labels (Fc: cyan, Q: purple, Gain: green/red)
+- **Static Filter Panel**: If `-sf` was used, the pinned filter appears with locked orange knobs at the right of the panel — visible for reference but not adjustable
 - **Reoptimize Button**: Re-run optimization using current GUI state as initial guess
 - **RMSE Display**: Live error metrics in both linear and dB domains
 
@@ -320,6 +352,10 @@ Room and headphone measurements contain:
 - **Solver**: Trust Region Reflective (TRF) with 3-point Jacobian
 - **Convergence**: xtol, ftol, gtol = 1e-9 for high precision
 
+### JIT-Accelerated Kernels
+
+The frequency-response inner loop — computing H(z) across the full grid for every biquad in every optimizer iteration — is the dominant runtime cost. AcoustiQ offloads this to Numba `@njit` kernels in `acoustiq_kernels.py`, which compile to native machine code with `fastmath=True` and are cached to disk on first run (`cache=True`). Worker processes started by PyQt6 or multiprocessing load the cached bytecode in under 100 ms rather than recompiling.
+
 ### Biquad Filters
 
 All filters use RBJ (Robert Bristow-Johnson) cookbook formulas:
@@ -341,7 +377,7 @@ H(z) = (b0 + b1*z^-1 + b2*z^-2) / (1 + a1*z^-1 + a2*z^-2)
 - Pure energy-domain loss (|H|² − target²)²
 - Soft-L1 (Huber) loss → large deviations dominate automatically
 - Broadband errors (shelves, overall tilt) naturally receive higher effective weight
-- Very light Gaussian smoothing (~3 % of points) only for numerical stability
+- Very light box-filter smoothing (~3 % of points) applied to the weight vector only, for numerical stability
 
 ---
 
@@ -399,9 +435,61 @@ python acoustiq.py \
   -rf 1000
 ```
 
+### Static Pinned Filter
+
+Pin a known peak correction at 1 kHz that should not move during optimization, then fit 6 peaks around it:
+
+```bash
+python acoustiq.py \
+  -s measurement.csv \
+  -t target.csv \
+  -p 6 \
+  -sf "PK,1000,0.707,-3.5" \
+  -o fitted_filters.txt \
+  -i
+```
+
+The pinned filter appears with locked orange knobs in the GUI and is appended to the output file with a `# STATIC (pinned)` marker.
+
+### Optimizer Suppression Masks
+
+Suppress optimizer weight in two problem regions — here a 3150 Hz windowing null (2 kHz wide, 26 dB deep) and a 9550 Hz reflection artefact (4 kHz wide, 34 dB deep):
+
+```bash
+python acoustiq.py \
+  -s measurement.csv \
+  -t target.csv \
+  -p 8 \
+  -fm1 "3150,2000,26" \
+  -fm2 "9550,4000,34" \
+  -o fitted_filters.txt
+```
+
+### Save Plot and Hide Traces
+
+Batch mode: optimize, save the plot as a PNG, hide noisy traces, skip the interactive viewer:
+
+```bash
+python acoustiq.py \
+  -s measurement.csv \
+  -t target.csv \
+  -p 7 \
+  --save-plot HD560S.png \
+  --hide-traces "Error Curve,Residual" \
+  -np
+```
+
 ---
 
 ## Troubleshooting
+
+### "First run is slow"
+
+Expected. Numba compiles the biquad kernels to native code on the first import and writes cache files next to `acoustiq_kernels.py`. All subsequent runs load from cache and start in milliseconds. If you move the files, the cache rebuilds once automatically.
+
+### "ModuleNotFoundError: acoustiq_kernels"
+
+`acoustiq_kernels.py` must be in the same directory as `acoustiq.py` (or on `PYTHONPATH`). Both files ship together — make sure neither was left out.
 
 ### "Should I smooth my measurement data first?"
 
@@ -411,7 +499,7 @@ python acoustiq.py \
 - **Your old workflow:** Measure → Smooth to 1/3 octave → Optimize in dB domain
 - **AcoustiQ workflow:** Measure → Optimize in energy domain (done!)
 
-The smoothing step isn't just unnecessary—it's counterproductive. It discards real resonance information that AcoustiQ can correct.
+The smoothing step isn't just unnecessary — it's counterproductive. It discards real resonance information that AcoustiQ can correct. If a particular frequency region is genuinely unreliable (e.g. a windowing null or reflection artefact), use `-fm1`/`-fm2` to suppress optimizer weight there instead of smoothing the whole measurement.
 
 ---
 
@@ -421,6 +509,7 @@ The smoothing step isn't just unnecessary—it's counterproductive. It discards 
 2. **Limit Iterations**: Set `-m 2000` for quick initial fits
 3. **Narrow Bounds**: Constrain frequency ranges to relevant audio bands
 4. **Disable Plotting**: Use `-np` for batch processing
+5. **Skip Output File**: Use `-no` when you only need the in-memory result (e.g. when calling from Python)
 
 ---
 
@@ -450,6 +539,7 @@ MIT License - see LICENSE file for details
 - RBJ Audio EQ Cookbook for biquad formulas
 - SciPy optimization team
 - PyQt6 and PyQtGraph developers
+- Numba team for JIT compilation infrastructure
 
 ---
 
